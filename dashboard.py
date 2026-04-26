@@ -33,12 +33,34 @@ MONO     = "'IBM Plex Mono', 'Courier New', monospace"
 SANS     = "'IBM Plex Sans', Arial, sans-serif"
 
 FATOR_COLORS = {
-    "Ibovespa": "#4a9eff",
-    "S&P 500":  "#00c27a",
-    "USD/BRL":  "#e8830c",
-    "Ouro":     "#f5cc00",
-    "Petróleo": "#9b6dff",
-    "Alpha":    "#5a6478",
+    # Renda Variável
+    "Ibovespa":     "#4a9eff",
+    "S&P 500":      "#00c27a",
+    "Nasdaq":       "#00e5a0",
+    "Euro Stoxx":   "#3db8f5",
+    "Hang Seng":    "#1a6fa8",
+    # Juros
+    "Treasury 10Y": "#f5cc00",
+    "Treasury 3M":  "#f5e070",
+    "Treasury 30Y": "#c9a800",
+    "IMA-B 5+":     "#ffe066",
+    "IRF-M":        "#b8a000",
+    # Moedas
+    "USD/BRL":      "#e8830c",
+    "EUR/BRL":      "#f0a050",
+    "JPY/BRL":      "#c46000",
+    "DXY":          "#ff6b35",
+    # Commodities
+    "Ouro":         "#ffd700",
+    "Petróleo":     "#9b6dff",
+    "Prata":        "#c0c0c0",
+    "Cobre":        "#b87333",
+    "Açúcar":       "#ff9eb5",
+    # Volatilidade / Risk-On
+    "VIX":          "#e8404a",
+    "Bitcoin":      "#f7931a",
+    # Alpha residual
+    "Alpha":        "#5a6478",
 }
 
 # ── CSS (servido via Flask — sem conflito com template Dash) ──────────────────
