@@ -41,15 +41,40 @@ FUNDOS = {
 
 # Fatores de mercado  →  {nome_amigável: ticker Yahoo Finance}
 FATORES = {
-    "Ibovespa": "^BVSP",
-    "S&P 500":  "^GSPC",
-    "USD/BRL":  "BRL=X",
-    "Ouro":     "GC=F",
-    "Petróleo": "CL=F",
+    # ── Renda Variável ──────────────────────────────────────────────
+    "Ibovespa":     "^BVSP",
+    "S&P 500":      "^GSPC",
+    "Nasdaq":       "^NDX",
+    "Euro Stoxx":   "^STOXX50E",
+    "Hang Seng":    "^HSI",
+    # ── Juros ────────────────────────────────────────────────────────
+    "Treasury 10Y": "^TNX",
+    "Treasury 3M":  "^IRX",
+    "Treasury 30Y": "^TYX",
+    "IMA-B 5+":     "B5P211.SA",
+    "IRF-M":        "IRFM11.SA",
+    # ── Moedas ───────────────────────────────────────────────────────
+    "USD/BRL":      "BRL=X",
+    "EUR/BRL":      "EURBRL=X",
+    "JPY/BRL":      "JPYBRL=X",
+    "DXY":          "DX-Y.NYB",
+    # ── Commodities ──────────────────────────────────────────────────
+    "Ouro":         "GC=F",
+    "Petróleo":     "CL=F",
+    "Prata":        "SI=F",
+    "Cobre":        "HG=F",
+    "Açúcar":       "SB=F",
+    # ── Volatilidade / Risk-On ───────────────────────────────────────
+    "VIX":          "^VIX",
+    "Bitcoin":      "BTC-USD",
 }
 
 # Janela rolling para betas (None = usa o período inteiro)
 JANELA_ROLLING = None   # ex: 21 para betas móveis de 21 dias
+
+# Ridge regularization — evita multicolinearidade com muitos fatores
+# None = OLS puro | float (ex: 1.0) = Ridge
+RIDGE_ALPHA = 1.0
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -202,33 +227,70 @@ def calcular_retorno_fundo(df_cotas: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def estimar_betas_ols(
+def estimar_betas(
     retorno_fundo: pd.Series,
     retornos_fatores: pd.DataFrame,
-) -> pd.Series:
+    ridge_alpha: float | None = None,
+) -> tuple:
     """
-    Estima betas via OLS (full-period).
+    Estima betas via OLS ou Ridge (quando ridge_alpha > 0).
 
-    Parâmetros
-    ----------
-    retorno_fundo     : Series com retornos diários do fundo (%)
-    retornos_fatores  : DataFrame com retornos dos fatores (%)
+    Ridge é recomendado com muitos fatores correlacionados para evitar
+    multicolinearidade. ridge_alpha controla a força da regularização.
 
-    Retorna
-    -------
-    Series com betas para cada fator (e intercepto = alpha médio diário)
+    Retorna (params: Series, modelo)
     """
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+
     dados = retornos_fatores.join(retorno_fundo.rename("fundo"), how="inner").dropna()
-    X = sm.add_constant(dados[retornos_fatores.columns])
+    X_raw = dados[retornos_fatores.columns]
     y = dados["fundo"]
-    modelo = sm.OLS(y, X).fit()
-    return modelo.params, modelo  # params + modelo completo para diagnósticos
+
+    if ridge_alpha is not None:
+        # Ridge: normaliza X, estima, desnormaliza betas
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_raw)
+        model = Ridge(alpha=ridge_alpha, fit_intercept=True)
+        model.fit(X_scaled, y)
+        # Desnormaliza betas para escala original
+        betas_raw = model.coef_ / scaler.scale_
+        intercept = model.intercept_ - (betas_raw * scaler.mean_).sum()
+        params = pd.Series(
+            [intercept] + list(betas_raw),
+            index=["const"] + list(retornos_fatores.columns),
+        )
+        # Calcula R² para diagnóstico
+        y_pred = model.predict(X_scaled)
+        ss_res = ((y - y_pred) ** 2).sum()
+        ss_tot = ((y - y.mean()) ** 2).sum()
+        r2 = 1 - ss_res / ss_tot
+        # Objeto mock para compatibilidade com resumo_betas
+        class _MockModel:
+            def __init__(self):
+                self.params   = params
+                self.rsquared = r2
+                self.bse      = pd.Series(np.nan, index=params.index)
+                self.tvalues  = pd.Series(np.nan, index=params.index)
+                self.pvalues  = pd.Series(np.nan, index=params.index)
+        return params, _MockModel()
+    else:
+        # OLS puro
+        X = sm.add_constant(X_raw)
+        modelo = sm.OLS(y, X).fit()
+        return modelo.params, modelo
+
+
+# Alias para compatibilidade retroativa
+def estimar_betas_ols(retorno_fundo, retornos_fatores):
+    return estimar_betas(retorno_fundo, retornos_fatores, ridge_alpha=None)
 
 
 def atribuir_pnl(
     df_cotas_retorno: pd.DataFrame,
     retornos_mercado: pd.DataFrame,
     janela_rolling: int | None = None,
+    ridge_alpha: float | None = None,
 ) -> pd.DataFrame:
     """
     Junta cotas e mercado e decompõe o PnL diário por fator.
@@ -263,8 +325,9 @@ def atribuir_pnl(
 
         if janela_rolling is None:
             # ── Betas do período inteiro ──────────────────────────────────
-            betas, modelo = estimar_betas_ols(
-                merged["retorno_fundo_%"], merged[fatores_cols]
+            betas, modelo = estimar_betas(
+                merged["retorno_fundo_%"], merged[fatores_cols],
+                ridge_alpha=ridge_alpha,
             )
             betas_df = pd.DataFrame(
                 [betas.values] * len(merged),
@@ -279,8 +342,9 @@ def atribuir_pnl(
                     betas_list.append(pd.Series(np.nan, index=["const"] + fatores_cols))
                     continue
                 janela = merged.iloc[i - janela_rolling : i]
-                b, _ = estimar_betas_ols(
-                    janela["retorno_fundo_%"], janela[fatores_cols]
+                b, _ = estimar_betas(
+                    janela["retorno_fundo_%"], janela[fatores_cols],
+                    ridge_alpha=ridge_alpha,
                 )
                 betas_list.append(b)
             betas_df = pd.DataFrame(betas_list, index=merged.index)
@@ -355,7 +419,7 @@ def main():
     df_cotas_ret = calcular_retorno_fundo(df_cotas)
 
     # 3. Atribuição de PnL
-    df_atrib = atribuir_pnl(df_cotas_ret, retornos_mercado, JANELA_ROLLING)
+    df_atrib = atribuir_pnl(df_cotas_ret, retornos_mercado, JANELA_ROLLING, RIDGE_ALPHA)
 
     # 4. Tabela de betas
     df_betas = resumo_betas(df_cotas_ret, retornos_mercado)
