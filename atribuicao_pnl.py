@@ -1,0 +1,388 @@
+"""
+atribuicao_pnl.py
+-----------------
+Junta dados de mercado (Yahoo Finance) com cotas de fundos (CVM) e
+decompõe o PnL diário do fundo em contribuições por fator de mercado
+via regressão OLS (betas rolling ou full-period).
+
+Uso:
+    python atribuicao_pnl.py
+
+Saída:
+    atribuicao_pnl.csv   — tabela completa de atribuição
+    betas_ols.csv        — betas estimados (e erros padrão)
+"""
+
+# ── Imports ──────────────────────────────────────────────────────────────────
+import io
+import zipfile
+from datetime import date
+
+import numpy as np
+import pandas as pd
+import requests
+import statsmodels.api as sm
+import yfinance as yf
+from dateutil.relativedelta import relativedelta
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                        CONFIGURAÇÃO CENTRAL                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# Período de análise (dias úteis)
+DATA_INICIO = "2026-04-01"
+DATA_FIM    = "2026-04-23"
+
+# Fundos monitorados  →  {nome_amigável: CNPJ}
+FUNDOS = {
+    "SPX Nimitz Feeder": "12.831.360/0001-14",
+    # "Outro Fundo": "XX.XXX.XXX/0001-XX",
+}
+
+# Fatores de mercado  →  {nome_amigável: ticker Yahoo Finance}
+FATORES = {
+    "Ibovespa": "^BVSP",
+    "S&P 500":  "^GSPC",
+    "USD/BRL":  "BRL=X",
+    "Ouro":     "GC=F",
+    "Petróleo": "CL=F",
+}
+
+# Janela rolling para betas (None = usa o período inteiro)
+JANELA_ROLLING = None   # ex: 21 para betas móveis de 21 dias
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                     MÓDULO 1 — DADOS DE MERCADO                        ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def obter_retornos_mercado(
+    fatores: dict[str, str],
+    data_inicio: str,
+    data_fim: str,
+) -> pd.DataFrame:
+    """
+    Baixa preços de fechamento via Yahoo Finance e calcula retornos diários (%).
+
+    Retorna
+    -------
+    DataFrame  [date index, colunas = nomes amigáveis dos fatores]
+    """
+    tickers = list(fatores.values())
+    nome_para_ticker = {v: k for k, v in fatores.items()}
+
+    print(f"[mercado] Baixando {len(tickers)} tickers: {data_inicio} → {data_fim}")
+    raw = yf.download(
+        tickers,
+        start=data_inicio,
+        end=data_fim,
+        auto_adjust=True,
+        progress=False,
+    )
+
+    # Suporte a download de ticker único (yfinance retorna estrutura diferente)
+    if isinstance(raw.columns, pd.MultiIndex):
+        fechamento = raw["Close"].copy()
+    else:
+        fechamento = raw[["Close"]].copy()
+        fechamento.columns = tickers
+
+    fechamento.index = pd.to_datetime(fechamento.index).date
+    fechamento.rename(columns=nome_para_ticker, inplace=True)
+
+    retornos = fechamento.pct_change() * 100
+    retornos.index.name = "data"
+
+    print(f"[mercado] {len(retornos)} linhas carregadas.\n")
+    return retornos
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                     MÓDULO 2 — COTAS CVM                               ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _baixar_informe_cvm(ano_mes: str) -> pd.DataFrame:
+    """Baixa e descompacta o informe diário da CVM para um dado ano-mês (YYYYMM)."""
+    url = (
+        f"https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/"
+        f"inf_diario_fi_{ano_mes}.zip"
+    )
+    print(f"[cvm] Baixando: {url}")
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+        with z.open(z.namelist()[0]) as f:
+            return pd.read_csv(
+                f, sep=";", dtype={"CNPJ_FUNDO": str, "CNPJ_FUNDO_CLASSE": str},
+                encoding="latin-1",
+            )
+
+
+def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
+    """
+    Baixa cotas diárias da CVM para os CNPJs informados.
+    Tenta o mês corrente; se indisponível, recua mês a mês (até 3 tentativas).
+
+    Retorna
+    -------
+    DataFrame com colunas: data, fundo, cnpj, vl_quota, patrimonio_liq, num_cotistas
+    """
+    hoje = date.today()
+
+    df_raw = None
+    for delta in range(3):
+        mes_ref = hoje - relativedelta(months=delta)
+        ano_mes = mes_ref.strftime("%Y%m")
+        try:
+            df_raw = _baixar_informe_cvm(ano_mes)
+            print(f"[cvm] Mês carregado: {mes_ref.strftime('%B/%Y')}\n")
+            break
+        except Exception:
+            print(f"[cvm] {ano_mes} indisponível, tentando mês anterior...")
+
+    if df_raw is None:
+        raise RuntimeError("Não foi possível baixar nenhum informe diário da CVM.")
+
+    # Suporte ao rename de coluna da CVM em 2025
+    cnpj_col = (
+        "CNPJ_FUNDO_CLASSE" if "CNPJ_FUNDO_CLASSE" in df_raw.columns else "CNPJ_FUNDO"
+    )
+    df_raw[cnpj_col] = df_raw[cnpj_col].str.strip()
+
+    cnpjs = list(fundos.values())
+    df_f = df_raw[df_raw[cnpj_col].isin(cnpjs)].copy()
+
+    if df_f.empty:
+        raise ValueError(
+            "Nenhum CNPJ encontrado no arquivo CVM. Verifique o dicionário FUNDOS."
+        )
+
+    cnpj_para_nome = {v: k for k, v in fundos.items()}
+    df_f["fundo"] = df_f[cnpj_col].map(cnpj_para_nome)
+    df_f["data"]  = pd.to_datetime(df_f["DT_COMPTC"]).dt.date
+
+    df_out = (
+        df_f.rename(columns={
+            cnpj_col:       "cnpj",
+            "VL_QUOTA":     "vl_quota",
+            "VL_PATRIM_LIQ": "patrimonio_liq",
+            "NR_COTST":     "num_cotistas",
+        })
+        [["data", "fundo", "cnpj", "vl_quota", "patrimonio_liq", "num_cotistas"]]
+        .sort_values(["fundo", "data"])
+        .reset_index(drop=True)
+    )
+
+    print(f"[cvm] {len(df_out)} registros encontrados.\n")
+    return df_out
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                     MÓDULO 3 — ATRIBUIÇÃO DE PnL                       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def calcular_retorno_fundo(df_cotas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula o retorno diário da cota (%) e o PnL em R$ por dia.
+
+    PnL_BRL = retorno_dia (decimal) × patrimônio_liq do dia anterior
+    """
+    df = df_cotas.copy().sort_values(["fundo", "data"])
+
+    df["retorno_fundo_%"] = (
+        df.groupby("fundo")["vl_quota"]
+        .pct_change() * 100
+    )
+    df["patrimonio_anterior"] = (
+        df.groupby("fundo")["patrimonio_liq"].shift(1)
+    )
+    df["pnl_brl"] = (
+        df["retorno_fundo_%"] / 100 * df["patrimonio_anterior"]
+    )
+    return df
+
+
+def estimar_betas_ols(
+    retorno_fundo: pd.Series,
+    retornos_fatores: pd.DataFrame,
+) -> pd.Series:
+    """
+    Estima betas via OLS (full-period).
+
+    Parâmetros
+    ----------
+    retorno_fundo     : Series com retornos diários do fundo (%)
+    retornos_fatores  : DataFrame com retornos dos fatores (%)
+
+    Retorna
+    -------
+    Series com betas para cada fator (e intercepto = alpha médio diário)
+    """
+    dados = retornos_fatores.join(retorno_fundo.rename("fundo"), how="inner").dropna()
+    X = sm.add_constant(dados[retornos_fatores.columns])
+    y = dados["fundo"]
+    modelo = sm.OLS(y, X).fit()
+    return modelo.params, modelo  # params + modelo completo para diagnósticos
+
+
+def atribuir_pnl(
+    df_cotas_retorno: pd.DataFrame,
+    retornos_mercado: pd.DataFrame,
+    janela_rolling: int | None = None,
+) -> pd.DataFrame:
+    """
+    Junta cotas e mercado e decompõe o PnL diário por fator.
+
+    Para cada dia d:
+        contrib_fator_d = beta_fator × retorno_fator_d
+        alpha_d         = retorno_fundo_d − Σ(contrib_fator_d) − intercepto
+
+    Parâmetros
+    ----------
+    janela_rolling : se None, usa betas do período inteiro para todos os dias.
+                     Se inteiro (ex: 21), recalcula betas com janela deslizante.
+
+    Retorna
+    -------
+    DataFrame com colunas:
+        data, fundo, retorno_fundo_%, pnl_brl,
+        [contrib_<fator> para cada fator],
+        alpha_%, pnl_explicado_brl, pnl_alpha_brl
+    """
+    resultados = []
+
+    for nome_fundo, grupo in df_cotas_retorno.groupby("fundo"):
+        grupo = grupo.set_index("data").sort_index()
+
+        # Alinha datas entre fundo e mercado (inner join)
+        merged = grupo[["retorno_fundo_%", "pnl_brl", "patrimonio_anterior"]].join(
+            retornos_mercado, how="inner"
+        ).dropna(subset=["retorno_fundo_%"] + list(retornos_mercado.columns))
+
+        fatores_cols = list(retornos_mercado.columns)
+
+        if janela_rolling is None:
+            # ── Betas do período inteiro ──────────────────────────────────
+            betas, modelo = estimar_betas_ols(
+                merged["retorno_fundo_%"], merged[fatores_cols]
+            )
+            betas_df = pd.DataFrame(
+                [betas.values] * len(merged),
+                index=merged.index,
+                columns=betas.index,
+            )
+        else:
+            # ── Betas rolling ─────────────────────────────────────────────
+            betas_list = []
+            for i in range(len(merged)):
+                if i < janela_rolling:
+                    betas_list.append(pd.Series(np.nan, index=["const"] + fatores_cols))
+                    continue
+                janela = merged.iloc[i - janela_rolling : i]
+                b, _ = estimar_betas_ols(
+                    janela["retorno_fundo_%"], janela[fatores_cols]
+                )
+                betas_list.append(b)
+            betas_df = pd.DataFrame(betas_list, index=merged.index)
+
+        # ── Calcula contribuições diárias ─────────────────────────────────
+        contrib_cols = []
+        for fator in fatores_cols:
+            col = f"contrib_{fator}_%"
+            contrib_cols.append(col)
+            merged[col] = betas_df[fator] * merged[fator]
+
+        merged["soma_contribs_%"] = merged[contrib_cols].sum(axis=1)
+        merged["alpha_%"] = (
+            merged["retorno_fundo_%"]
+            - betas_df.get("const", 0)
+            - merged["soma_contribs_%"]
+        )
+
+        # ── PnL em R$ por componente ──────────────────────────────────────
+        for fator in fatores_cols:
+            merged[f"pnl_{fator}_brl"] = (
+                merged[f"contrib_{fator}_%"] / 100 * merged["patrimonio_anterior"]
+            )
+        merged["pnl_alpha_brl"]     = merged["alpha_%"] / 100 * merged["patrimonio_anterior"]
+        merged["pnl_explicado_brl"] = merged[[f"pnl_{f}_brl" for f in fatores_cols]].sum(axis=1)
+
+        merged.insert(0, "fundo", nome_fundo)
+        resultados.append(merged.reset_index())
+
+    return pd.concat(resultados, ignore_index=True) if resultados else pd.DataFrame()
+
+
+def resumo_betas(
+    df_cotas_retorno: pd.DataFrame,
+    retornos_mercado: pd.DataFrame,
+) -> pd.DataFrame:
+    """Retorna tabela de betas OLS (full-period) com erro padrão e t-stat."""
+    rows = []
+    for nome_fundo, grupo in df_cotas_retorno.groupby("fundo"):
+        grupo = grupo.set_index("data").sort_index()
+        fatores_cols = list(retornos_mercado.columns)
+        merged = grupo[["retorno_fundo_%"]].join(retornos_mercado, how="inner").dropna()
+        _, modelo = estimar_betas_ols(merged["retorno_fundo_%"], merged[fatores_cols])
+
+        for param in modelo.params.index:
+            rows.append({
+                "fundo":    nome_fundo,
+                "fator":    param,
+                "beta":     modelo.params[param],
+                "std_err":  modelo.bse[param],
+                "t_stat":   modelo.tvalues[param],
+                "p_value":  modelo.pvalues[param],
+                "r2":       modelo.rsquared,
+            })
+    return pd.DataFrame(rows)
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                            MAIN                                         ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def main():
+    pd.set_option("display.float_format", "{:.4f}".format)
+    pd.set_option("display.max_columns", 20)
+    pd.set_option("display.width", 160)
+
+    # 1. Coleta de dados
+    retornos_mercado = obter_retornos_mercado(FATORES, DATA_INICIO, DATA_FIM)
+    df_cotas         = obter_cotas_fundos(FUNDOS)
+
+    # 2. Retorno diário da cota + PnL em R$
+    df_cotas_ret = calcular_retorno_fundo(df_cotas)
+
+    # 3. Atribuição de PnL
+    df_atrib = atribuir_pnl(df_cotas_ret, retornos_mercado, JANELA_ROLLING)
+
+    # 4. Tabela de betas
+    df_betas = resumo_betas(df_cotas_ret, retornos_mercado)
+
+    # 5. Exibe resultados
+    fatores_cols = list(FATORES.keys())
+    colunas_exibir = (
+        ["data", "fundo", "retorno_fundo_%", "pnl_brl"]
+        + [f"contrib_{f}_%" for f in fatores_cols]
+        + ["alpha_%", "pnl_explicado_brl", "pnl_alpha_brl"]
+    )
+    print("=" * 80)
+    print("ATRIBUIÇÃO DE PnL DIÁRIO")
+    print("=" * 80)
+    print(df_atrib[colunas_exibir].to_string(index=False))
+
+    print("\n" + "=" * 80)
+    print("BETAS OLS (período completo)")
+    print("=" * 80)
+    pd.set_option("display.float_format", "{:.6f}".format)
+    print(df_betas.to_string(index=False))
+
+    # 6. Salva CSVs
+    df_atrib.to_csv("atribuicao_pnl.csv", index=False)
+    df_betas.to_csv("betas_ols.csv", index=False)
+    print("\nArquivos salvos: atribuicao_pnl.csv | betas_ols.csv")
+
+
+if __name__ == "__main__":
+    main()
