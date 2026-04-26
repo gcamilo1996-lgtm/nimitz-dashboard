@@ -3,14 +3,14 @@ dashboard.py — SPX Nimitz | PnL Attribution Monitor
 Bloomberg-style Dash app. Deploy on Railway.
 """
 
-import os, sys
+import os, sys, traceback
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import dash
-from dash import dcc, html, Input, Output, State, callback_context
+from dash import dcc, html, Input, Output, callback_context
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -64,7 +64,10 @@ def fmt_pct(v, decimals=3):
     return f"{sign}{v:.{decimals}f}%"
 
 def color_val(v):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    try:
+        if v is None or np.isnan(v):
+            return MUTED
+    except (TypeError, ValueError):
         return MUTED
     return GREEN if v >= 0 else RED
 
@@ -358,9 +361,6 @@ body {{
 app.layout = html.Div([
     html.Style(GLOBAL_CSS),
 
-    # Store de dados
-    dcc.Store(id="store-data"),
-
     # Top bar
     html.Div([
         html.Div([
@@ -441,7 +441,7 @@ def refresh_dashboard(n_clicks):
         # ── Gráfico 1: Barras empilhadas de PnL ──────────────────────────
         fig_bar = go.Figure()
         for fator in fatores + ["Alpha"]:
-            key = f"pnl_{fator}_brl" if fator != "Alpha" else "pnl_alpha_brl"
+            key = "pnl_" + fator.lower().replace(" ", "_").replace("&", "").replace("/", "") + "_brl"
             fig_bar.add_trace(go.Bar(
                 name=fator,
                 x=df["data"].dt.strftime("%d/%m"),
@@ -570,6 +570,7 @@ def refresh_dashboard(n_clicks):
         return [metrics, charts, chart_ret, betas_section], ultima_data
 
     except Exception as e:
+        traceback.print_exc()
         error_block = html.Div(
             f"ERRO AO CARREGAR DADOS: {str(e)}",
             className="error-msg"
