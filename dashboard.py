@@ -3,14 +3,14 @@ dashboard.py — SPX Nimitz | PnL Attribution Monitor
 Bloomberg-style Dash app. Deploy on Railway.
 """
 
-import os, sys, traceback
+import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import dash
-from dash import dcc, html, Input, Output, callback_context
+from dash import dcc, html, Input, Output, State, callback_context
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -64,10 +64,7 @@ def fmt_pct(v, decimals=3):
     return f"{sign}{v:.{decimals}f}%"
 
 def color_val(v):
-    try:
-        if v is None or np.isnan(v):
-            return MUTED
-    except (TypeError, ValueError):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
         return MUTED
     return GREEN if v >= 0 else RED
 
@@ -80,6 +77,27 @@ app = dash.Dash(
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 server = app.server   # expõe o Flask server para o Railway
+
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>''' + GLOBAL_CSS + '''</style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 # ── CSS inline (sem arquivo externo) ─────────────────────────────────────────
 
@@ -359,7 +377,8 @@ body {{
 # ── Layout ───────────────────────────────────────────────────────────────────
 
 app.layout = html.Div([
-    html.Style(GLOBAL_CSS),
+    # Store de dados
+    dcc.Store(id="store-data"),
 
     # Top bar
     html.Div([
@@ -441,7 +460,7 @@ def refresh_dashboard(n_clicks):
         # ── Gráfico 1: Barras empilhadas de PnL ──────────────────────────
         fig_bar = go.Figure()
         for fator in fatores + ["Alpha"]:
-            key = "pnl_" + fator.lower().replace(" ", "_").replace("&", "").replace("/", "") + "_brl"
+            key = f"pnl_{fator}_brl" if fator != "Alpha" else "pnl_alpha_brl"
             fig_bar.add_trace(go.Bar(
                 name=fator,
                 x=df["data"].dt.strftime("%d/%m"),
@@ -570,7 +589,6 @@ def refresh_dashboard(n_clicks):
         return [metrics, charts, chart_ret, betas_section], ultima_data
 
     except Exception as e:
-        traceback.print_exc()
         error_block = html.Div(
             f"ERRO AO CARREGAR DADOS: {str(e)}",
             className="error-msg"
