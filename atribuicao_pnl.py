@@ -316,10 +316,18 @@ def atribuir_pnl(
     for nome_fundo, grupo in df_cotas_retorno.groupby("fundo"):
         grupo = grupo.set_index("data").sort_index()
 
-        # Alinha datas entre fundo e mercado (inner join)
+        # Alinha datas entre fundo e mercado
+        # left join: mantém todas as datas do fundo;
+        # fatores sem dado naquele dia ficam 0 (sem contribuição)
         merged = grupo[["retorno_fundo_%", "pnl_brl", "patrimonio_anterior"]].join(
-            retornos_mercado, how="inner"
-        ).dropna(subset=["retorno_fundo_%"] + list(retornos_mercado.columns))
+            retornos_mercado, how="left"
+        ).dropna(subset=["retorno_fundo_%"])
+        # Preenche fatores ausentes com 0 (não contribuem naquele dia)
+        for col in retornos_mercado.columns:
+            if col in merged.columns:
+                merged[col] = merged[col].fillna(0.0)
+            else:
+                merged[col] = 0.0
 
         fatores_cols = list(retornos_mercado.columns)
 
