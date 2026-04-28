@@ -29,10 +29,10 @@ from dateutil.relativedelta import relativedelta
 # ║                        CONFIGURAÇÃO CENTRAL                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-# Período de análise — sempre MTD, atualizado automaticamente
+# Período de análise — YTD (1º de janeiro do ano corrente)
 _hoje       = date.today()
-DATA_INICIO = _hoje.replace(day=1).strftime("%Y-%m-%d")   # 1º dia do mês corrente
-DATA_FIM    = (_hoje + timedelta(days=1)).strftime("%Y-%m-%d")  # +1 dia (end é exclusivo no yfinance)
+DATA_INICIO = _hoje.replace(month=1, day=1).strftime("%Y-%m-%d")  # 1º jan do ano corrente
+DATA_FIM    = (_hoje + timedelta(days=1)).strftime("%Y-%m-%d")     # +1 dia (end exclusivo no yfinance)
 
 # Fundos monitorados — importados de cotas_fundos.py (única fonte de verdade)
 from cotas_fundos import FUNDOS  # noqa: E402
@@ -153,8 +153,12 @@ def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
     """
     hoje = date.today()
 
+    # Calcula quantos meses cobrir a partir de DATA_INICIO
+    inicio = date.fromisoformat(DATA_INICIO)
+    meses_cobrir = (hoje.year - inicio.year) * 12 + (hoje.month - inicio.month) + 1
+
     dfs = []
-    for delta in range(3):
+    for delta in range(meses_cobrir):
         mes_ref = hoje - relativedelta(months=delta)
         ano_mes = mes_ref.strftime("%Y%m")
         try:
