@@ -144,7 +144,8 @@ def _baixar_informe_cvm(ano_mes: str) -> pd.DataFrame:
 def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
     """
     Baixa cotas diárias da CVM para os CNPJs informados.
-    Tenta o mês corrente; se indisponível, recua mês a mês (até 3 tentativas).
+    Tenta os últimos 3 meses e combina tudo — garante que fundos que ainda não
+    publicaram o mês corrente apareçam com dados do mês anterior.
 
     Retorna
     -------
@@ -152,19 +153,21 @@ def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
     """
     hoje = date.today()
 
-    df_raw = None
+    dfs = []
     for delta in range(3):
         mes_ref = hoje - relativedelta(months=delta)
         ano_mes = mes_ref.strftime("%Y%m")
         try:
-            df_raw = _baixar_informe_cvm(ano_mes)
-            print(f"[cvm] Mês carregado: {mes_ref.strftime('%B/%Y')}\n")
-            break
+            dfs.append(_baixar_informe_cvm(ano_mes))
+            print(f"[cvm] Carregado: {mes_ref.strftime('%B/%Y')}")
         except Exception:
-            print(f"[cvm] {ano_mes} indisponível, tentando mês anterior...")
+            print(f"[cvm] {ano_mes} indisponível, pulando...")
 
-    if df_raw is None:
+    if not dfs:
         raise RuntimeError("Não foi possível baixar nenhum informe diário da CVM.")
+
+    df_raw = pd.concat(dfs, ignore_index=True).drop_duplicates()
+    print(f"[cvm] Total combinado: {len(df_raw)} registros\n")
 
     # Suporte ao rename de coluna da CVM em 2025
     cnpj_col = (
