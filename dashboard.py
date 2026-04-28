@@ -64,7 +64,7 @@ FUND_COLORS = [
     "#e8404a", "#00e5a0", "#f0a050", "#ffd700", "#c0c0c0", "#ff9eb5",
 ]
 
-_cache: dict = {"df_atrib": None, "df_betas": None, "cdi": None}
+_cache: dict = {"df_atrib": None, "df_betas_ytd": None, "df_betas_mtd": None, "cdi": None}
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -136,6 +136,16 @@ def build_css():
         ".detail-metric-label { font-family:" + SANS + "; font-size:9px; text-transform:uppercase;"
         " letter-spacing:1px; color:" + MUTED + "; margin-bottom:4px; }\n"
         ".detail-metric-value { font-family:" + MONO + "; font-size:18px; font-weight:600; }\n"
+
+        # Period toggle buttons
+        ".period-toggle { display:flex; gap:4px; }\n"
+        ".period-btn { font-family:" + MONO + "; font-size:10px; font-weight:600;"
+        " letter-spacing:1px; text-transform:uppercase; padding:4px 12px;"
+        " border:1px solid " + BORDER + "; background:transparent; color:" + MUTED + ";"
+        " cursor:pointer; transition:all .15s; }\n"
+        ".period-btn:hover { border-color:" + ORANGE + "; color:" + TEXT + "; }\n"
+        ".period-btn.active { background:" + ORANGE + "; color:" + BG + ";"
+        " border-color:" + ORANGE + "; }\n"
 
         ".error-msg { font-family:" + MONO + "; font-size:12px; color:" + RED + ";"
         " background:" + SURFACE + "; border:1px solid " + RED + ";"
@@ -499,16 +509,28 @@ def refresh_dashboard(n_clicks):
             ret_mercado        = obter_retornos_mercado(FATORES, DATA_INICIO, DATA_FIM)
             df_cotas           = obter_cotas_fundos(FUNDOS)
             df_ret             = calcular_retorno_fundo(df_cotas)
-            _cache["df_atrib"] = atribuir_pnl(df_ret, ret_mercado, JANELA_ROLLING, RIDGE_ALPHA)
-            _cache["df_betas"] = resumo_betas(df_ret, ret_mercado)
+            _cache["df_atrib"]    = atribuir_pnl(df_ret, ret_mercado, JANELA_ROLLING, RIDGE_ALPHA)
+            _cache["df_betas_ytd"] = resumo_betas(df_ret, ret_mercado)
+
+            # Betas MTD — usa Ridge pois o mês corrente tem poucos dias vs 21 fatores
+            from datetime import date as _date
+            mtd_start = _date.today().replace(day=1)
+            df_ret_mtd      = df_ret[df_ret["data"] >= mtd_start]
+            ret_mercado_mtd = ret_mercado[ret_mercado.index >= mtd_start]
+            try:
+                _cache["df_betas_mtd"] = resumo_betas(df_ret_mtd, ret_mercado_mtd,
+                                                       ridge_alpha=RIDGE_ALPHA)
+            except Exception:
+                _cache["df_betas_mtd"] = None
+
             try:
                 _cache["cdi"] = obter_cdi(DATA_INICIO, DATA_FIM)
             except Exception:
                 _cache["cdi"] = None
 
-        df_atrib = _cache["df_atrib"]
-        df_betas = _cache["df_betas"]
-        cdi      = _cache["cdi"]
+        df_atrib    = _cache["df_atrib"]
+        df_betas    = _cache["df_betas_ytd"]
+        cdi         = _cache["cdi"]
 
         if df_atrib is None or df_atrib.empty:
             return [html.Div("Sem dados disponíveis.", className="error-msg")], "—", {}, "—"
@@ -524,12 +546,17 @@ def refresh_dashboard(n_clicks):
         # ── Seção 1: Heatmap betas ────────────────────────────────────────
         heatmap_section = html.Div([
             html.Div([
-                html.Span("POSICIONAMENTO POR FATOR — BETAS OLS", className="card-title"),
-                html.Span("verde = long  ·  vermelho = short",
-                          style={"fontFamily": MONO, "fontSize": "9px", "color": MUTED}),
+                html.Span("POSICIONAMENTO POR FATOR — BETAS", className="card-title"),
+                html.Div([
+                    html.Button("MTD", id="btn-period-mtd", n_clicks=0,
+                                className="period-btn"),
+                    html.Button("YTD", id="btn-period-ytd", n_clicks=0,
+                                className="period-btn active"),
+                ], className="period-toggle"),
             ], className="card-header"),
             html.Div(
-                dcc.Graph(figure=_build_heatmap(df_betas),
+                dcc.Graph(id="heatmap-graph",
+                          figure=_build_heatmap(df_betas),
                           config={"displayModeBar": False}),
                 className="heatmap-wrap",
             ),
@@ -554,7 +581,7 @@ def refresh_dashboard(n_clicks):
                 html.Span("MTD  ·  alpha  ·  PnL  ·  β Ibovespa  ·  R²",
                           style={"fontFamily": MONO, "fontSize": "9px", "color": MUTED}),
             ], className="card-header"),
-            html.Div(_build_fund_list(df_atrib, df_betas), id="fund-list"),
+            html.Div(_build_fund_list(df_atrib, _cache["df_betas_ytd"]), id="fund-list"),
         ], className="card")
 
         return [heatmap_section, perf_section, fund_section], ultima_data, dot_style, regime_text
@@ -565,6 +592,30 @@ def refresh_dashboard(n_clicks):
             [html.Div(f"ERRO: {str(e)}\n\n{traceback.format_exc()}", className="error-msg")],
             "ERRO", {}, "ERRO",
         )
+
+
+# ── Heatmap period toggle ────────────────────────────────────────────────────
+
+@app.callback(
+    Output("heatmap-graph",   "figure"),
+    Output("btn-period-mtd",  "className"),
+    Output("btn-period-ytd",  "className"),
+    Input("btn-period-mtd",   "n_clicks"),
+    Input("btn-period-ytd",   "n_clicks"),
+    prevent_initial_call=True,
+)
+def update_heatmap_period(n_mtd, n_ytd):
+    ctx = callback_context
+    triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else "btn-period-ytd"
+    period = "MTD" if "mtd" in triggered else "YTD"
+
+    df_betas = _cache.get(f"df_betas_{period.lower()}")
+    if df_betas is None or df_betas.empty:
+        raise dash.exceptions.PreventUpdate
+
+    mtd_cls = "period-btn active" if period == "MTD" else "period-btn"
+    ytd_cls = "period-btn active" if period == "YTD" else "period-btn"
+    return _build_heatmap(df_betas), mtd_cls, ytd_cls
 
 
 # ── Accordion toggle ──────────────────────────────────────────────────────────

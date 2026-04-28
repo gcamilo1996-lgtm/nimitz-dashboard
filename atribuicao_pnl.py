@@ -417,17 +417,22 @@ def atribuir_pnl(
 def resumo_betas(
     df_cotas_retorno: pd.DataFrame,
     retornos_mercado: pd.DataFrame,
+    ridge_alpha: float | None = None,
 ) -> pd.DataFrame:
     """
-    Retorna tabela de betas OLS (full-period) com erro padrão e t-stat.
-    Sempre usa OLS puro para preservar inferência estatística (p-values, t-stats).
+    Retorna tabela de betas com erro padrão e t-stat.
+    ridge_alpha=None → OLS puro (preserva p-values); float → Ridge (para períodos curtos
+    onde OLS é sub-determinado, e.g. MTD com menos observações que fatores).
     """
     rows = []
     for nome_fundo, grupo in df_cotas_retorno.groupby("fundo"):
         grupo = grupo.set_index("data").sort_index()
         fatores_cols = list(retornos_mercado.columns)
         merged = grupo[["retorno_fundo_%"]].join(retornos_mercado, how="inner").dropna()
-        _, modelo = estimar_betas_ols(merged["retorno_fundo_%"], merged[fatores_cols])
+        if merged.empty or len(merged) < 2:
+            continue
+        _, modelo = estimar_betas(merged["retorno_fundo_%"], merged[fatores_cols],
+                                  ridge_alpha=ridge_alpha)
 
         for param in modelo.params.index:
             rows.append({
