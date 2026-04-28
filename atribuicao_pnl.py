@@ -203,6 +203,30 @@ def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
     return df_out
 
 
+def obter_cdi(data_inicio: str, data_fim: str) -> pd.Series:
+    """
+    Busca CDI diário via API do Banco Central (série 12).
+    Retorna Series com index=date, values=retorno diário em %.
+    """
+    d_ini = pd.to_datetime(data_inicio).strftime("%d/%m/%Y")
+    d_fim = min(pd.to_datetime(data_fim).date(), date.today()).strftime("%d/%m/%Y")
+    url = (
+        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados"
+        f"?formato=json&dataInicial={d_ini}&dataFinal={d_fim}"
+    )
+    print(f"[cdi] Buscando: {d_ini} → {d_fim}")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    s = pd.Series(
+        {pd.to_datetime(r["data"], dayfirst=True).date(): float(r["valor"])
+         for r in resp.json()},
+        name="CDI",
+    )
+    s.index.name = "data"
+    print(f"[cdi] {len(s)} dias carregados.\n")
+    return s
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                     MÓDULO 3 — ATRIBUIÇÃO DE PnL                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
