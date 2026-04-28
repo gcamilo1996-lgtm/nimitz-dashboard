@@ -1,5 +1,5 @@
 """
-dashboard.py — SPX Nimitz | PnL Attribution Monitor
+dashboard.py — PnL Attribution Monitor
 Bloomberg-style Dash app. Deploy on Railway.
 """
 
@@ -10,13 +10,13 @@ import pandas as pd
 import numpy as np
 from flask import Response
 import dash
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, callback_context
 import plotly.graph_objects as go
 
 from atribuicao_pnl import (
     obter_retornos_mercado, obter_cotas_fundos,
     calcular_retorno_fundo, atribuir_pnl, resumo_betas,
-    FATORES, FUNDOS, DATA_INICIO, DATA_FIM,
+    FATORES, FUNDOS, DATA_INICIO, DATA_FIM, RIDGE_ALPHA, JANELA_ROLLING,
 )
 
 # ── Paleta Bloomberg ─────────────────────────────────────────────────────────
@@ -63,7 +63,10 @@ FATOR_COLORS = {
     "Alpha":        "#5a6478",
 }
 
-# ── CSS (servido via Flask — sem conflito com template Dash) ──────────────────
+# ── Cache em memória — evita re-download ao trocar de fundo ─────────────────
+_cache: dict = {"df_atrib": None, "df_betas": None}
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
 def build_css():
     return (
         "@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600"
@@ -74,23 +77,48 @@ def build_css():
         "::-webkit-scrollbar { width:4px; height:4px; }\n"
         "::-webkit-scrollbar-track { background:" + BG + "; }\n"
         "::-webkit-scrollbar-thumb { background:" + BORDER + "; border-radius:2px; }\n"
+
+        # ── Topbar ─────────────────────────────────────────────────────────
         ".topbar { display:flex; align-items:center; justify-content:space-between;"
         " padding:0 20px; height:48px; background:" + SURFACE + "; border-bottom:1px solid " + BORDER + ";"
         " position:sticky; top:0; z-index:100; }\n"
-        ".topbar-left { display:flex; align-items:center; gap:24px; }\n"
+        ".topbar-left { display:flex; align-items:center; gap:16px; flex:1; min-width:0; }\n"
         ".logo { font-family:" + MONO + "; font-size:14px; font-weight:600; color:" + ORANGE + ";"
-        " letter-spacing:3px; text-transform:uppercase; }\n"
-        ".divider-v { width:1px; height:20px; background:" + BORDER + "; }\n"
-        ".fund-name { font-family:" + SANS + "; font-size:12px; font-weight:500; color:" + TEXT + ";"
-        " letter-spacing:.5px; text-transform:uppercase; }\n"
-        ".topbar-right { display:flex; align-items:center; gap:16px; }\n"
-        ".last-update { font-family:" + MONO + "; font-size:11px; color:" + MUTED + "; }\n"
+        " letter-spacing:3px; text-transform:uppercase; white-space:nowrap; }\n"
+        ".divider-v { width:1px; height:20px; background:" + BORDER + "; flex-shrink:0; }\n"
+        ".topbar-right { display:flex; align-items:center; gap:16px; flex-shrink:0; }\n"
+        ".last-update { font-family:" + MONO + "; font-size:11px; color:" + MUTED + "; white-space:nowrap; }\n"
         ".last-update span { color:" + ORANGE + "; margin-left:6px; }\n"
         ".btn-refresh { font-family:" + MONO + "; font-size:11px; font-weight:600;"
         " letter-spacing:1.5px; text-transform:uppercase; color:" + BG + "; background:" + ORANGE + ";"
-        " border:none; padding:6px 16px; cursor:pointer; transition:opacity .15s; }\n"
+        " border:none; padding:6px 16px; cursor:pointer; transition:opacity .15s; white-space:nowrap; }\n"
         ".btn-refresh:hover { opacity:.85; }\n"
         ".btn-refresh:disabled { opacity:.4; cursor:wait; }\n"
+
+        # ── Fund selector dropdown ─────────────────────────────────────────
+        ".fund-select { width:280px !important; }\n"
+        ".fund-select .Select-control { background:" + SURFACE2 + " !important;"
+        " border:1px solid " + BORDER + " !important; border-radius:0 !important;"
+        " height:30px !important; min-height:30px !important; }\n"
+        ".fund-select .Select-control:hover { border-color:" + ORANGE + " !important; }\n"
+        ".fund-select .Select-value { line-height:30px !important; }\n"
+        ".fund-select .Select-value-label { color:" + TEXT + " !important;"
+        " font-family:" + MONO + " !important; font-size:11px !important; }\n"
+        ".fund-select .Select-placeholder { color:" + MUTED + " !important;"
+        " font-family:" + MONO + " !important; font-size:11px !important; line-height:30px !important; }\n"
+        ".fund-select .Select-arrow { border-color:" + MUTED + " transparent transparent !important; }\n"
+        ".fund-select .Select-menu-outer { background:" + SURFACE2 + " !important;"
+        " border:1px solid " + BORDER + " !important; border-radius:0 !important; }\n"
+        ".fund-select .Select-option { background:" + SURFACE2 + " !important;"
+        " color:" + TEXT + " !important; font-family:" + MONO + " !important; font-size:11px !important; }\n"
+        ".fund-select .Select-option:hover, .fund-select .Select-option.is-focused"
+        " { background:" + BORDER + " !important; }\n"
+        ".fund-select .Select-option.is-selected { background:" + ORANGE + " !important;"
+        " color:" + BG + " !important; }\n"
+        ".fund-select .Select-input input { color:" + TEXT + " !important;"
+        " font-family:" + MONO + " !important; font-size:11px !important; }\n"
+
+        # ── Main layout ────────────────────────────────────────────────────
         ".main { padding:16px 20px; display:flex; flex-direction:column; gap:12px; }\n"
         ".metrics-row { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }\n"
         ".metric-card { background:" + SURFACE + "; border:1px solid " + BORDER + ";"
@@ -127,12 +155,15 @@ def build_css():
 
 app = dash.Dash(
     __name__,
-    title="NIMITZ | PnL Monitor",
+    title="PnL Monitor | Attribution",
     update_title=None,
     external_stylesheets=["/nimitz.css"],
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
 )
 server = app.server
+
+# Default fund: SPX Nimitz Feeder (primeiro da lista FUNDOS)
+DEFAULT_FUND = "SPX Nimitz Feeder"
 
 
 @server.route("/nimitz.css")
@@ -149,7 +180,14 @@ app.layout = html.Div([
         html.Div([
             html.Div("BLOOMBERG", className="logo"),
             html.Div(className="divider-v"),
-            html.Div("SPX NIMITZ FEEDER · PnL ATTRIBUTION", className="fund-name"),
+            # ── Seletor de fundo ─────────────────────────────────────
+            dcc.Dropdown(
+                id="fund-selector",
+                options=[{"label": k, "value": k} for k in sorted(FUNDOS.keys())],
+                value=DEFAULT_FUND,
+                clearable=False,
+                className="fund-select",
+            ),
         ], className="topbar-left"),
 
         html.Div([
@@ -235,43 +273,81 @@ def _apply_layout(fig, barmode=None, height=260):
     Output("page-content", "children"),
     Output("last-cvm-date", "children"),
     Input("btn-refresh", "n_clicks"),
+    Input("fund-selector", "value"),
     prevent_initial_call=False,
 )
-def refresh_dashboard(n_clicks):
-    try:
-        ret_mercado = obter_retornos_mercado(FATORES, DATA_INICIO, DATA_FIM)
-        df_cotas    = obter_cotas_fundos(FUNDOS)
-        df_ret      = calcular_retorno_fundo(df_cotas)
-        df_atrib    = atribuir_pnl(df_ret, ret_mercado)
-        df_betas    = resumo_betas(df_ret, ret_mercado)
+def refresh_dashboard(n_clicks, fundo_selecionado):
+    # Identifica o que disparou o callback
+    ctx = callback_context
+    triggered_id = (
+        ctx.triggered[0]["prop_id"].split(".")[0]
+        if ctx.triggered else "btn-refresh"
+    )
 
-        df = df_atrib.dropna(subset=["retorno_fundo_%"]).copy()
+    try:
+        # ── Re-fetch apenas quando o botão é clicado ou cache está vazio ──
+        if triggered_id == "btn-refresh" or _cache["df_atrib"] is None:
+            ret_mercado          = obter_retornos_mercado(FATORES, DATA_INICIO, DATA_FIM)
+            df_cotas             = obter_cotas_fundos(FUNDOS)
+            df_ret               = calcular_retorno_fundo(df_cotas)
+            # atribuir_pnl usa Ridge (RIDGE_ALPHA) para estabilidade com 21 fatores
+            _cache["df_atrib"]   = atribuir_pnl(df_ret, ret_mercado, JANELA_ROLLING, RIDGE_ALPHA)
+            # resumo_betas usa OLS puro para preservar inferência estatística (p-values)
+            _cache["df_betas"]   = resumo_betas(df_ret, ret_mercado)
+
+        df_atrib = _cache["df_atrib"]
+        df_betas = _cache["df_betas"]
+
+        # ── Filtra pelo fundo selecionado ─────────────────────────────────
+        df = (
+            df_atrib[df_atrib["fundo"] == fundo_selecionado]
+            .dropna(subset=["retorno_fundo_%"])
+            .copy()
+        )
+
+        if df.empty:
+            return [html.Div(
+                f"Sem dados para o fundo '{fundo_selecionado}' no período.",
+                className="error-msg"
+            )], "—"
+
+        df_betas_f = df_betas[df_betas["fundo"] == fundo_selecionado]
+
         df["data"] = pd.to_datetime(df["data"])
-        df = df.sort_values("data")
+        df = df.sort_values("data").reset_index(drop=True)
         df["pnl_acum"] = df["pnl_brl"].cumsum()
 
         ultima_data = df["data"].max().strftime("%d/%m/%Y")
         fatores     = list(FATORES.keys())
+        n_pregioes  = len(df)
+
+        # Métricas — todas calculadas sobre o fundo selecionado
         pnl_total   = df["pnl_brl"].sum()
-        retorno_mtd = (1 + df["retorno_fundo_%"] / 100).prod() - 1
-        r2_val      = df_betas["r2"].iloc[0] if not df_betas.empty else None
-        beta_ibov   = df_betas.loc[df_betas["fator"] == "Ibovespa", "beta"].values
-        beta_ibov   = beta_ibov[0] if len(beta_ibov) else None
         pnl_hoje    = df.iloc[-1]["pnl_brl"]
+        retorno_mtd = float((1 + df["retorno_fundo_%"] / 100).prod() - 1)
+
+        r2_val = (
+            float(df_betas_f["r2"].iloc[0])
+            if not df_betas_f.empty else None
+        )
+        _ibov_betas = df_betas_f.loc[df_betas_f["fator"] == "Ibovespa", "beta"]
+        beta_ibov   = float(_ibov_betas.iloc[0]) if not _ibov_betas.empty else None
 
         # ── Métricas ──────────────────────────────────────────────────────
         metrics = html.Div([
-            _metric("PnL MTD",     fmt_brl(pnl_total),            color_val(pnl_total),   f"{len(df)} pregões"),
+            _metric("PnL MTD",     fmt_brl(pnl_total),            color_val(pnl_total),   f"{n_pregioes} pregões"),
             _metric("PnL HOJE",    fmt_brl(pnl_hoje),             color_val(pnl_hoje),    df.iloc[-1]["data"].strftime("%d/%m")),
             _metric("RETORNO MTD", fmt_pct(retorno_mtd * 100, 2), color_val(retorno_mtd), "retorno acum."),
-            _metric("R² MODELO",   f"{r2_val*100:.2f}%" if r2_val else "—", ORANGE,       "explicado pelos fatores"),
-            _metric("β IBOVESPA",  f"{beta_ibov:.3f}" if beta_ibov else "—", color_val(beta_ibov), "coef. estimado"),
+            _metric("R² MODELO",   f"{r2_val*100:.2f}%" if r2_val is not None else "—", ORANGE, "explicado pelos fatores"),
+            _metric("β IBOVESPA",  f"{beta_ibov:.3f}" if beta_ibov is not None else "—", color_val(beta_ibov), "coef. OLS estimado"),
         ], className="metrics-row")
 
         # ── Barras empilhadas ─────────────────────────────────────────────
         fig_bar = go.Figure()
         for fator in fatores + ["Alpha"]:
             key = f"pnl_{fator}_brl" if fator != "Alpha" else "pnl_alpha_brl"
+            if key not in df.columns:
+                continue
             fig_bar.add_trace(go.Bar(
                 name=fator,
                 x=df["data"].dt.strftime("%d/%m"),
@@ -359,10 +435,10 @@ def refresh_dashboard(n_clicks):
                       style={"height": "140px"}),
         ], className="chart-card-full")
 
-        # ── Betas ─────────────────────────────────────────────────────────
+        # ── Betas OLS ─────────────────────────────────────────────────────
         beta_cards = []
         for fator in fatores:
-            row = df_betas[df_betas["fator"] == fator]
+            row = df_betas_f[df_betas_f["fator"] == fator]
             if row.empty:
                 continue
             b  = row.iloc[0]
@@ -380,7 +456,7 @@ def refresh_dashboard(n_clicks):
                 ], className="beta-stats"),
             ], className="beta-card"))
 
-        r2_pct = df_betas["r2"].iloc[0] * 100 if not df_betas.empty else 0
+        r2_pct = float(df_betas_f["r2"].iloc[0]) * 100 if not df_betas_f.empty else 0
         betas_section = html.Div([
             html.Div([
                 html.Span("BETAS OLS — PERÍODO COMPLETO", className="card-title"),
@@ -393,7 +469,10 @@ def refresh_dashboard(n_clicks):
         return [metrics, charts, chart_ret, betas_section], ultima_data
 
     except Exception as e:
-        return [html.Div(f"ERRO: {str(e)}", className="error-msg")], "ERRO"
+        import traceback
+        tb = traceback.format_exc()
+        return [html.Div(f"ERRO: {str(e)}\n\n{tb}", className="error-msg",
+                         style={"whiteSpace": "pre-wrap"})], "ERRO"
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

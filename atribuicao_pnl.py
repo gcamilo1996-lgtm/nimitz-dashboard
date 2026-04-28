@@ -16,7 +16,7 @@ Saída:
 # ── Imports ──────────────────────────────────────────────────────────────────
 import io
 import zipfile
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -29,15 +29,13 @@ from dateutil.relativedelta import relativedelta
 # ║                        CONFIGURAÇÃO CENTRAL                             ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-# Período de análise (dias úteis)
-DATA_INICIO = "2026-04-01"
-DATA_FIM    = "2026-04-23"
+# Período de análise — sempre MTD, atualizado automaticamente
+_hoje       = date.today()
+DATA_INICIO = _hoje.replace(day=1).strftime("%Y-%m-%d")   # 1º dia do mês corrente
+DATA_FIM    = (_hoje + timedelta(days=1)).strftime("%Y-%m-%d")  # +1 dia (end é exclusivo no yfinance)
 
-# Fundos monitorados  →  {nome_amigável: CNPJ}
-FUNDOS = {
-    "SPX Nimitz Feeder": "12.831.360/0001-14",
-    # "Outro Fundo": "XX.XXX.XXX/0001-XX",
-}
+# Fundos monitorados — importados de cotas_fundos.py (única fonte de verdade)
+from cotas_fundos import FUNDOS  # noqa: E402
 
 # Fatores de mercado  →  {nome_amigável: ticker Yahoo Finance}
 FATORES = {
@@ -188,10 +186,10 @@ def obter_cotas_fundos(fundos: dict[str, str]) -> pd.DataFrame:
 
     df_out = (
         df_f.rename(columns={
-            cnpj_col:       "cnpj",
-            "VL_QUOTA":     "vl_quota",
+            cnpj_col:        "cnpj",
+            "VL_QUOTA":      "vl_quota",
             "VL_PATRIM_LIQ": "patrimonio_liq",
-            "NR_COTST":     "num_cotistas",
+            "NR_COTST":      "num_cotistas",
         })
         [["data", "fundo", "cnpj", "vl_quota", "patrimonio_liq", "num_cotistas"]]
         .sort_values(["fundo", "data"])
@@ -389,7 +387,10 @@ def resumo_betas(
     df_cotas_retorno: pd.DataFrame,
     retornos_mercado: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Retorna tabela de betas OLS (full-period) com erro padrão e t-stat."""
+    """
+    Retorna tabela de betas OLS (full-period) com erro padrão e t-stat.
+    Sempre usa OLS puro para preservar inferência estatística (p-values, t-stats).
+    """
     rows = []
     for nome_fundo, grupo in df_cotas_retorno.groupby("fundo"):
         grupo = grupo.set_index("data").sort_index()
@@ -399,13 +400,13 @@ def resumo_betas(
 
         for param in modelo.params.index:
             rows.append({
-                "fundo":    nome_fundo,
-                "fator":    param,
-                "beta":     modelo.params[param],
-                "std_err":  modelo.bse[param],
-                "t_stat":   modelo.tvalues[param],
-                "p_value":  modelo.pvalues[param],
-                "r2":       modelo.rsquared,
+                "fundo":   nome_fundo,
+                "fator":   param,
+                "beta":    modelo.params[param],
+                "std_err": modelo.bse[param],
+                "t_stat":  modelo.tvalues[param],
+                "p_value": modelo.pvalues[param],
+                "r2":      modelo.rsquared,
             })
     return pd.DataFrame(rows)
 
@@ -426,10 +427,10 @@ def main():
     # 2. Retorno diário da cota + PnL em R$
     df_cotas_ret = calcular_retorno_fundo(df_cotas)
 
-    # 3. Atribuição de PnL
+    # 3. Atribuição de PnL (Ridge para estabilidade com 21 fatores)
     df_atrib = atribuir_pnl(df_cotas_ret, retornos_mercado, JANELA_ROLLING, RIDGE_ALPHA)
 
-    # 4. Tabela de betas
+    # 4. Tabela de betas (OLS para inferência estatística)
     df_betas = resumo_betas(df_cotas_ret, retornos_mercado)
 
     # 5. Exibe resultados
